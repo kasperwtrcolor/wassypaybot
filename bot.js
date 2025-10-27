@@ -42,8 +42,7 @@ async function handleMention(tweet) {
     const senderData = await senderResp.json().catch(() => ({}));
 
     if (!senderData.success) {
-      const msg = `⚠️ You need a WASSY Pay account before sending money.
-👉 Visit https://wassy.dev.fun to create one.`;
+      const msg = `⚠️ You need a WASSY Pay account before sending money.\n👉 Visit https://wassy.dev.fun to create one.`;
       await rwClient.v2.reply(msg, id);
       await log(`❌ No Dev.fun profile found for ${author_id}`);
       return;
@@ -80,12 +79,25 @@ async function handleMention(tweet) {
   }
 }
 
-// === Poll mentions loop ===
+// === Poll mentions loop (fixed for new API) ===
 let lastSeenId = null;
+let botUserId = null;
+
+async function initBotUser() {
+  try {
+    const me = await rwClient.v2.me();
+    botUserId = me.data.id;
+    await log(`🤖 Bot user ID: ${botUserId}`);
+  } catch (err) {
+    await log(`❌ Failed to get bot user ID: ${err.message}`);
+  }
+}
 
 async function pollMentions() {
   try {
-    const mentions = await rwClient.v2.mentions("bot_wassy", {
+    if (!botUserId) return; // wait for initialization
+
+    const mentions = await rwClient.v2.userMentionTimeline(botUserId, {
       since_id: lastSeenId,
       "tweet.fields": "author_id,text,created_at"
     });
@@ -101,12 +113,12 @@ async function pollMentions() {
   }
 }
 
-// === Interval polling ===
+// === Initialize and start polling ===
+await initBotUser();
 setInterval(pollMentions, 15000);
 await log("🚀 WASSY Bot is live — watching mentions every 15s...");
 
 // === Keepalive endpoint ===
 app.get("/", (_, res) => res.send("🤖 WASSY Bot active."));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => log(`🌐 Server listening on port ${PORT}`));

@@ -26,7 +26,7 @@ function parseTweet(text) {
   return { handle: match[1], amount: parseFloat(match[2]) };
 }
 
-// === Core mention handler ===
+// === Handle one mention ===
 async function handleMention(tweet) {
   try {
     const { id, text, author_id } = tweet;
@@ -42,7 +42,9 @@ async function handleMention(tweet) {
     const senderData = await senderResp.json().catch(() => ({}));
 
     if (!senderData.success) {
-      const msg = `⚠️ You need a WASSY Pay account before sending money.\n👉 Visit https://wassy.dev.fun to create one.`;
+      const msg =
+        `⚠️ You need a WASSY Pay account before sending money.\n` +
+        `👉 Visit https://wassy.dev.fun to create one.`;
       await rwClient.v2.reply(msg, id);
       await log(`❌ No Dev.fun profile found for ${author_id}`);
       return;
@@ -79,10 +81,10 @@ async function handleMention(tweet) {
   }
 }
 
-// === Poll mentions loop (with rate-limit backoff) ===
+// === Poll mentions (free-tier safe) ===
 let lastSeenId = null;
 let botUserId = null;
-let pollInterval = 30000; // start at 30s, will adapt if rate limited
+let pollInterval = 70 * 1000; // ~1 request per minute
 
 async function initBotUser() {
   try {
@@ -113,19 +115,17 @@ async function pollMentions() {
       }
     }
 
-    pollInterval = 30000; // reset to 30s after success
+    pollInterval = 70 * 1000; // keep stable
   } catch (err) {
     await log(`⚠️ Polling error: ${err.message}`);
-
-    // If it's a rate limit, slow down exponentially
     if (err.code === 429 || /429/.test(err.message)) {
-      pollInterval = Math.min(pollInterval * 2, 10 * 60 * 1000); // cap at 10 minutes
+      // Exponential backoff, up to 15 min
+      pollInterval = Math.min(pollInterval * 2, 15 * 60 * 1000);
       await log(`⏱️ Rate-limited. Backing off to ${pollInterval / 1000}s`);
     }
   }
 }
 
-// === Adaptive polling loop ===
 async function pollMentionsLoop() {
   await pollMentions();
   setTimeout(pollMentionsLoop, pollInterval);
@@ -134,7 +134,7 @@ async function pollMentionsLoop() {
 // === Initialize and start polling ===
 await initBotUser();
 pollMentionsLoop();
-await log("🚀 WASSY Bot live — adaptive polling enabled...");
+await log("🚀 WASSY Bot live — free-tier polling (≈1 req/min) enabled...");
 
 // === Keepalive endpoint ===
 app.get("/", (_, res) => res.send("🤖 WASSY Bot active."));

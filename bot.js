@@ -14,7 +14,7 @@ const client = new TwitterApi({
   appKey: process.env.TWITTER_APP_KEY,
   appSecret: process.env.TWITTER_APP_SECRET,
   accessToken: process.env.TWITTER_ACCESS_TOKEN,
-  accessSecret: process.env.TWITTER_ACCESS_SECRET
+  accessSecret: process.env.TWITTER_ACCESS_SECRET,
 });
 const rwClient = client.readWrite;
 
@@ -55,8 +55,8 @@ async function handleMention(tweet) {
       body: JSON.stringify({
         fromTwitterId: author_id,
         toHandle: handle,
-        amount
-      })
+        amount,
+      }),
     });
 
     const result = await sendResp.json().catch(() => ({}));
@@ -79,9 +79,10 @@ async function handleMention(tweet) {
   }
 }
 
-// === Poll mentions loop (fixed for new API) ===
+// === Poll mentions loop (with rate-limit backoff) ===
 let lastSeenId = null;
 let botUserId = null;
+let pollInterval = 30000; // start at 30s, will adapt if rate limited
 
 async function initBotUser() {
   try {
@@ -95,28 +96,45 @@ async function initBotUser() {
 
 async function pollMentions() {
   try {
-    if (!botUserId) return; // wait for initialization
+    if (!botUserId) return;
 
-    const mentions = await rwClient.v2.userMentionTimeline(botUserId, {
-      since_id: lastSeenId,
-      "tweet.fields": "author_id,text,created_at"
-    });
+    const options = {
+      "tweet.fields": "author_id,text,created_at",
+      max_results: 5,
+    };
+    if (lastSeenId) options.since_id = lastSeenId;
 
-    if (!mentions.data?.length) return;
+    const mentions = await rwClient.v2.userMentionTimeline(botUserId, options);
 
-    for (const tweet of mentions.data.reverse()) {
-      await handleMention(tweet);
-      lastSeenId = tweet.id;
+    if (mentions.data?.length) {
+      for (const tweet of mentions.data.reverse()) {
+        await handleMention(tweet);
+        lastSeenId = tweet.id;
+      }
     }
+
+    pollInterval = 30000; // reset to 30s after success
   } catch (err) {
     await log(`⚠️ Polling error: ${err.message}`);
+
+    // If it's a rate limit, slow down exponentially
+    if (err.code === 429 || /429/.test(err.message)) {
+      pollInterval = Math.min(pollInterval * 2, 10 * 60 * 1000); // cap at 10 minutes
+      await log(`⏱️ Rate-limited. Backing off to ${pollInterval / 1000}s`);
+    }
   }
+}
+
+// === Adaptive polling loop ===
+async function pollMentionsLoop() {
+  await pollMentions();
+  setTimeout(pollMentionsLoop, pollInterval);
 }
 
 // === Initialize and start polling ===
 await initBotUser();
-setInterval(pollMentions, 15000);
-await log("🚀 WASSY Bot is live — watching mentions every 15s...");
+pollMentionsLoop();
+await log("🚀 WASSY Bot live — adaptive polling enabled...");
 
 // === Keepalive endpoint ===
 app.get("/", (_, res) => res.send("🤖 WASSY Bot active."));

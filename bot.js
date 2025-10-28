@@ -1,142 +1,103 @@
 import express from "express";
 import dotenv from "dotenv";
+import cors from "cors";
 import fetch from "node-fetch";
 import { TwitterApi } from "twitter-api-v2";
-import { log } from "./utils.js";
 
 dotenv.config();
 
+const {
+  X_API_KEY,
+  X_API_SECRET,
+  X_ACCESS_TOKEN,
+  X_ACCESS_SECRET,
+  BACKEND_URL,
+  PORT = 3000
+} = process.env;
+
 const app = express();
+app.use(cors());
 app.use(express.json());
 
-// === Twitter client setup ===
-const client = new TwitterApi({
-  appKey: process.env.TWITTER_APP_KEY,
-  appSecret: process.env.TWITTER_APP_SECRET,
-  accessToken: process.env.TWITTER_ACCESS_TOKEN,
-  accessSecret: process.env.TWITTER_ACCESS_SECRET,
+const xClient = new TwitterApi({
+  appKey: X_API_KEY,
+  appSecret: X_API_SECRET,
+  accessToken: X_ACCESS_TOKEN,
+  accessSecret: X_ACCESS_SECRET
 });
-const rwClient = client.readWrite;
 
-// === Command parser ===
-function parseTweet(text) {
-  const regex = /send\s+@(\w+)\s*\$?([\d.]+)/i;
-  const match = text.match(regex);
-  if (!match) return null;
-  return { handle: match[1], amount: parseFloat(match[2]) };
+const rwClient = xClient.readWrite;
+
+async function replyToTweet(tweetId, message) {
+  try {
+    await rwClient.v2.reply(message, tweetId);
+    console.log(`💬 Replied to ${tweetId}: ${message}`);
+  } catch (err) {
+    console.error("❌ Reply failed:", err?.data || err);
+  }
 }
 
-// === Handle one mention ===
-async function handleMention(tweet) {
+// 🔥 MAIN HANDLER — receives tweet events from your backend
+app.post("/api/handleTweet", async (req, res) => {
   try {
-    const { id, text, author_id } = tweet;
-    const command = parseTweet(text);
-    if (!command) return;
-
-    const { handle, amount } = command;
-    await log(`💬 Detected command: @${handle} $${amount}`);
-
-    // === Check if sender has a Dev.fun account ===
-    const senderCheckUrl = `${process.env.BACKEND_URL}/api/check-profile?handle=${author_id}`;
-    const senderResp = await fetch(senderCheckUrl);
-    const senderData = await senderResp.json().catch(() => ({}));
-
-    if (!senderData.success) {
-      const msg =
-        `⚠️ You need a WASSY Pay account before sending money.\n` +
-        `👉 Visit https://wassy.dev.fun to create one.`;
-      await rwClient.v2.reply(msg, id);
-      await log(`❌ No Dev.fun profile found for ${author_id}`);
-      return;
+    const { tweet_id, text, sender_handle } = req.body;
+    if (!tweet_id || !text || !sender_handle) {
+      return res.status(400).json({ error: "Missing required fields" });
     }
 
-    // === Proceed to payment ===
-    const sendResp = await fetch(`${process.env.BACKEND_URL}/api/send`, {
+    console.log(`📥 New tweet from @${sender_handle}: ${text}`);
+
+    const regex = /send\s*@(\w+)\s*\$?([\d.]+)/i;
+    const match = text.match(regex);
+    if (!match) {
+      return res.json({ message: "No payment command found" });
+    }
+
+    const recipient = match[1];
+    const amount = parseFloat(match[2]);
+    console.log(`🧾 Command detected: send $${amount} to @${recipient}`);
+
+    // Check sender profile
+    const senderCheck = await fetch(`${BACKEND_URL}/api/check-profile?handle=${sender_handle}`);
+    const senderData = await senderCheck.json();
+    if (!senderData.success) {
+      await replyToTweet(tweet_id, `@${sender_handle} You need a WASSY Pay account on dev.fun before sending payments.`);
+      return res.json({ success: false });
+    }
+
+    // Check recipient profile
+    const recvCheck = await fetch(`${BACKEND_URL}/api/check-profile?handle=${recipient}`);
+    const recvData = await recvCheck.json();
+    if (!recvData.success) {
+      await replyToTweet(tweet_id, `@${sender_handle} The recipient @${recipient} isn’t registered on WASSY Pay yet.`);
+      return res.json({ success: false });
+    }
+
+    // Perform transfer
+    const transfer = await fetch(`${BACKEND_URL}/api/send`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        fromTwitterId: author_id,
-        toHandle: handle,
-        amount,
-      }),
+        fromTwitterId: sender_handle,
+        toHandle: recipient,
+        amount
+      })
     });
 
-    const result = await sendResp.json().catch(() => ({}));
-    await log(`Backend response: ${JSON.stringify(result)}`);
-
-    // === Construct reply ===
-    let message;
-    if (result.success) {
-      message = `✅ Sent $${amount} to @${handle}!`;
-    } else if (result.message?.includes("Payment")) {
-      message = `💸 Payment request detected — complete $${amount} transfer here:\n${process.env.BACKEND_URL}`;
+    const result = await transfer.json();
+    if (transfer.status === 200 && result.success) {
+      await replyToTweet(tweet_id, `✅ @${sender_handle} sent $${amount} USDC to @${recipient} via WASSY Pay!`);
+    } else if (transfer.status === 402) {
+      await replyToTweet(tweet_id, `⚠️ @${sender_handle} Insufficient funds — top up your vault on WASSY Pay.`);
     } else {
-      message = `⚠️ Unable to process your request right now.`;
+      await replyToTweet(tweet_id, `❌ @${sender_handle} Payment failed: ${result.message || "unknown error"}`);
     }
 
-    await rwClient.v2.reply(message, id);
-    await log(`✅ Replied to tweet ${id}`);
+    res.json({ success: true });
   } catch (err) {
-    await log(`❌ Error handling mention: ${err.message}`);
+    console.error("💥 Error in handleTweet:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
-}
+});
 
-// === Poll mentions (free-tier safe) ===
-let lastSeenId = null;
-let botUserId = null;
-let pollInterval = 70 * 1000; // ~1 request per minute
-
-async function initBotUser() {
-  try {
-    const me = await rwClient.v2.me();
-    botUserId = me.data.id;
-    await log(`🤖 Bot user ID: ${botUserId}`);
-  } catch (err) {
-    await log(`❌ Failed to get bot user ID: ${err.message}`);
-  }
-}
-
-async function pollMentions() {
-  try {
-    if (!botUserId) return;
-
-    const options = {
-      "tweet.fields": "author_id,text,created_at",
-      max_results: 5,
-    };
-    if (lastSeenId) options.since_id = lastSeenId;
-
-    const mentions = await rwClient.v2.userMentionTimeline(botUserId, options);
-
-    if (mentions.data?.length) {
-      for (const tweet of mentions.data.reverse()) {
-        await handleMention(tweet);
-        lastSeenId = tweet.id;
-      }
-    }
-
-    pollInterval = 70 * 1000; // keep stable
-  } catch (err) {
-    await log(`⚠️ Polling error: ${err.message}`);
-    if (err.code === 429 || /429/.test(err.message)) {
-      // Exponential backoff, up to 15 min
-      pollInterval = Math.min(pollInterval * 2, 15 * 60 * 1000);
-      await log(`⏱️ Rate-limited. Backing off to ${pollInterval / 1000}s`);
-    }
-  }
-}
-
-async function pollMentionsLoop() {
-  await pollMentions();
-  setTimeout(pollMentionsLoop, pollInterval);
-}
-
-// === Initialize and start polling ===
-await initBotUser();
-pollMentionsLoop();
-await log("🚀 WASSY Bot live — free-tier polling (≈1 req/min) enabled...");
-
-// === Keepalive endpoint ===
-app.get("/", (_, res) => res.send("🤖 WASSY Bot active."));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log(`🌐 Server listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 WASSY Bot webhook live on port ${PORT}`));

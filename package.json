@@ -1,5 +1,5 @@
 {
-  "name": "wassy-bot",
+  "name": "wassy-pay-bot",
   "version": "1.0.0",
   "main": "bot.js",
   "type": "module",
@@ -9,8 +9,8 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
-    "node-fetch": "^3.3.2",
     "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
     "twitter-api-v2": "^1.16.0"
   }
 }
